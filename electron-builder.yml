@@ -1,0 +1,27 @@
+appId: com.relaxreader.app
+productName: RelaxReader
+copyright: Copyright © 2024-2026 Relax Reader Team
+directories:
+  buildResources: build
+  output: dist
+files:
+  - out/**/*
+  - '!node_modules'
+mac:
+  category: public.app-category.books
+  target: [dmg, zip]
+  artifactName: ${name}-${version}-mac.${ext}
+  darkModeSupport: true
+win:
+  target: [nsis]
+  artifactName: ${name}-${version}-win.${ext}
+linux:
+  target: [AppImage, deb]
+  category: Utility
+  artifactName: ${name}-${version}-linux.${ext}
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: true
+  installerLanguages: ["zh_CN", "en_US"]
+  language: 2052
