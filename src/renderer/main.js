@@ -17,5 +17,5 @@ window.electronAPI?.getPlatform().then(platform => {
 
 // Initialize store data from electron-store
 const store = useReaderStore()
-store.loadBooks()
+store.loadBooks().then(() => store.loadCacheStats())
 store.loadSettings()

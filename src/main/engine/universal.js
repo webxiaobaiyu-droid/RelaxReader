@@ -5,24 +5,31 @@ import { fetchHtml } from './parser.js'
  * Works with most Chinese novel sites without site-specific config.
  */
 export async function parseBookPage(url) {
-  const html = await fetchHtml(url)
-  if (!html) return { success: false, error: '无法访问该页面' }
+  let html
+  try {
+    html = await fetchHtml(url)
+  } catch (e) {
+    return { success: false, error: `无法访问该页面：${e.message}` }
+  }
+  if (!html) return { success: false, error: '页面返回为空' }
 
   const base = new URL(url)
 
   // ── Title ──
+  // Prefer h1 (usually the cleanest), fall back to <title> with suffix stripping
   let title = ''
-  const titleMatch = html.match(/<title>([^<]+)<\/title>/i)
-  if (titleMatch) {
-    title = titleMatch[1]
-      .replace(/[_|—\-–].*$/, '')    // remove site suffix
-      .replace(/全文阅读|最新章节|无弹窗|笔趣阁|小说网.*$/g, '')
-      .trim()
+  const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)
+  if (h1Match) {
+    title = h1Match[1].replace(/<[^>]+>/g, '').trim()
   }
-  // Fallback: find h1
-  if (!title) {
-    const h1Match = html.match(/<h1[^>]*>([^<]+)<\/h1>/i)
-    if (h1Match) title = h1Match[1].trim()
+  if (!title || title.length > 40) {
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/i)
+    if (titleMatch) {
+      title = titleMatch[1]
+        .replace(/[_|·—\-–]\s*[^_|·—\-–]*$/, '')  // strip last suffix segment
+        .replace(/(全文阅读|最新章节|无弹窗|笔趣阁|小说网|在线阅读|TXT下载).*$/g, '')
+        .trim()
+    }
   }
   if (!title) title = '未知书名'
 
@@ -39,11 +46,12 @@ export async function parseBookPage(url) {
 
   // ── Cover ──
   let cover = null
-  const coverMatch = html.match(/<img[^>]*?(?:cover|封面|fmimg)[^>]*?src=["']([^"']+)["']/i)
+  const coverMatch = html.match(/<img[^>]*?(?:cover|封面|fmimg|bookimg)[^>]*?src=["']([^"']+)["']/i)
+    || html.match(/<img[^>]*src=["']([^"']+)["'][^>]*(?:alt|title)=["'][^"']*(?:封面|书籍|小说)[^"']*["']/i)
+    || html.match(/<div[^>]*(?:id|class)=["'][^"']*(?:cover|fmimg|bookimg)[^"']*["'][^>]*>[\s\S]*?<img[^>]*src=["']([^"']+)["']/i)
     || html.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i)
   if (coverMatch) {
-    cover = coverMatch[1]
-    if (!cover.startsWith('http')) cover = new URL(cover, base).href
+    cover = normalizeUrl(coverMatch[1], base.href)
   }
 
   // ── Chapters ──
@@ -75,20 +83,36 @@ export async function parseBookPage(url) {
     // Penalize if text looks like navigation
     if (/^[上下前後]/.test(text)) score -= 20
 
-    candidates.push({ href, title: text, score })
+    candidates.push({ href, title: text, score, pos: match.index })
+  }
+
+  // Dedupe candidates by URL — many sites repeat the same link in nav + list
+  const seenUrl = new Set()
+  const unique = []
+  for (const c of candidates) {
+    if (seenUrl.has(c.href)) continue
+    seenUrl.add(c.href)
+    unique.push(c)
   }
 
   // Take top-scoring links as chapters
-  candidates.sort((a, b) => b.score - a.score)
-  const threshold = candidates.length > 10 ? candidates[Math.floor(candidates.length * 0.3)]?.score || 0 : 0
-  const chapters = candidates
-    .filter(c => c.score >= Math.max(threshold, 3))
-    .map((c, i) => ({ index: i, title: c.title, url: c.href, content: '' }))
+  unique.sort((a, b) => b.score - a.score)
+  const threshold = unique.length > 10 ? unique[Math.floor(unique.length * 0.3)]?.score || 0 : 0
+  const filtered = unique.filter(c => c.score >= Math.max(threshold, 3))
 
-  // If we got too few chapters, lower threshold
-  const finalChapters = chapters.length >= 5
-    ? chapters.slice(0, 5000)
-    : candidates.slice(0, 5000).map((c, i) => ({ index: i, title: c.title, url: c.href, content: '' }))
+  // If high-confidence filter killed everything, fall back to all candidates
+  const picked = filtered.length >= 5 ? filtered : unique
+
+  // Re-sort by DOM order so reading order is preserved
+  picked.sort((a, b) => a.pos - b.pos)
+
+  const chapters = picked.slice(0, 5000).map((c, i) => ({
+    index: i, title: c.title, url: c.href, content: ''
+  }))
+
+  if (chapters.length === 0) {
+    return { success: false, error: '页面上未识别到章节链接，请确认这是小说目录页（不是首页/详情页）' }
+  }
 
   return {
     success: true,
@@ -96,9 +120,22 @@ export async function parseBookPage(url) {
       title, author, cover,
       sourceId: 'universal',
       bookUrl: url,
-      chapters: finalChapters,
+      chapters,
       description: ''
     }
+  }
+}
+
+function normalizeUrl(url, baseUrl) {
+  if (!url || typeof url !== 'string') return null
+  const trimmed = url.trim()
+  if (!trimmed || trimmed.startsWith('data:')) return trimmed || null
+  try {
+    if (/^https?:\/\//i.test(trimmed)) return trimmed
+    if (trimmed.startsWith('//')) return `${new URL(baseUrl).protocol}${trimmed}`
+    return new URL(trimmed, baseUrl).href
+  } catch {
+    return trimmed
   }
 }
 
@@ -106,8 +143,13 @@ export async function parseBookPage(url) {
  * Fetch chapter content with generic content extraction.
  */
 export async function fetchChapterContent(chapterUrl) {
-  const html = await fetchHtml(chapterUrl)
-  if (!html) return { success: false, error: '无法获取章节' }
+  let html
+  try {
+    html = await fetchHtml(chapterUrl)
+  } catch (e) {
+    return { success: false, error: `无法获取章节：${e.message}` }
+  }
+  if (!html) return { success: false, error: '章节页面为空' }
 
   // Try common content containers
   const contentPatterns = [
@@ -122,7 +164,23 @@ export async function fetchChapterContent(chapterUrl) {
   let content = ''
   for (const p of contentPatterns) {
     const m = html.match(p)
-    if (m && m[1].length > 200) { content = m[1]; break }
+    if (m && m[1].length > 200) {
+      // Handle base64-encoded content (e.g. qsbs.bb('...') calls)
+      if (m[1].includes('qsbs.bb') || m[1].includes('atob(')) {
+        const b64Regex = /(?:qsbs\.bb|atob)\s*\(\s*['"]([A-Za-z0-9+/=]+)['"]\s*\)/g
+        const parts = []
+        let b64m
+        while ((b64m = b64Regex.exec(m[1])) !== null) {
+          try { parts.push(Buffer.from(b64m[1], 'base64').toString('utf-8')) } catch {}
+        }
+        if (parts.length > 0) {
+          content = parts.join('')
+          break
+        }
+      }
+      content = m[1]
+      break
+    }
   }
 
   // Fallback: extract the largest text block

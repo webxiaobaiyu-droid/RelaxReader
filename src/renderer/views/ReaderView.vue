@@ -7,7 +7,7 @@
   >
     <!-- ═══ Auto-hiding header ═══ -->
     <header class="r-header" :class="{ visible: showUI }">
-      <button class="r-hdr-btn" @click="$router.push('/')" title="返回书架 (Esc)">
+      <button class="r-hdr-btn" @click="backToLibrary" title="返回书架 (Esc)">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg>
       </button>
       <button class="r-hdr-btn" @click="showToc = true" title="目录 (T)">
@@ -17,6 +17,9 @@
       <button class="r-hdr-btn" @click="toggleAutoScroll" :title="autoScrolling ? '停止滚动' : '自动滚动'">
         <svg v-if="!autoScrolling" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
         <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+      </button>
+      <button class="r-hdr-btn" :class="{ active: isBookmarked }" @click="toggleBookmark" :title="isBookmarked ? '取消书签 (B)' : '添加书签 (B)'">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
       </button>
       <button class="r-hdr-btn" @click="showSettings = true" title="设置 (S)">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><text x="4" y="21" font-size="20" font-weight="700" fill="currentColor" stroke="none">A</text></svg>
@@ -86,11 +89,20 @@
         <div class="progress-fill" :style="{ width: store.progressPercent + '%' }" />
       </div>
       <span class="progress-pct">{{ store.progressPercent }}%</span>
+      <span class="cache-state" :class="cacheState">{{ cacheStateLabel }}</span>
       <span class="time-est" v-if="timeEstimate">≈{{ timeEstimate }}</span>
     </footer>
 
     <!-- ═══ TOC Sidebar ═══ -->
-    <ChapterTOC :visible="showToc" :chapters="store.currentBook?.chapters ?? []" :currentIndex="store.currentChapterIndex" @close="showToc = false" @jump="jumpToChapter" />
+    <ChapterTOC
+      :visible="showToc"
+      :chapters="store.currentBook?.chapters ?? []"
+      :currentIndex="store.currentChapterIndex"
+      :bookmarks="store.currentBook?.bookmarks ?? []"
+      @close="showToc = false"
+      @jump="jumpToChapter"
+      @jump-bookmark="jumpToBookmark"
+    />
 
     <!-- ═══ Settings ═══ -->
     <ReadingSettings :visible="showSettings" @close="showSettings = false" />
@@ -117,6 +129,7 @@ const showUI = ref(false)
 const showToc = ref(false)
 const showSettings = ref(false)
 const loading = ref(false)
+const cacheState = ref('idle')
 const scrollPercent = ref(0)
 const autoScrolling = ref(false)
 const currentPage = ref(0)
@@ -235,6 +248,14 @@ const renderedContent = computed(() => {
   return text.split('\n').filter(p => p.trim()).map(p => `<p>${escapeHtml(p.trim())}</p>`).join('')
 })
 
+const isBookmarked = computed(() => store.isCurrentBookmarked())
+const cacheStateLabel = computed(() => {
+  if (cacheState.value === 'cached') return '已缓存'
+  if (cacheState.value === 'network') return '已联网更新'
+  if (cacheState.value === 'loading') return '加载中'
+  return ''
+})
+
 function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
@@ -306,41 +327,21 @@ onMounted(async () => {
   loading.value = true
   try {
     await store.openBook(bookMeta)
-    await nextTick()
-    const ch = store.currentChapter
-    if (ch?.url && !ch.content && (store.currentBook?.format === 'online' || store.currentBook?.sourceId === 'universal')) {
-      try {
-        const res = store.currentBook.sourceId === 'universal'
-          ? await window.electronAPI?.fetchContent(ch.url)
-          : await window.electronAPI?.fetchSourceChapter(store.currentBook.sourceId, ch.url)
-        if (res?.success) ch.content = res.data
-      } catch {}
-    }
-    await nextTick()
-    if (bodyRef.value && store.scrollPosition > 0) {
-      const maxScroll = bodyRef.value.scrollHeight - bodyRef.value.clientHeight
-      bodyRef.value.scrollTop = (store.scrollPosition / 100) * maxScroll
-    }
+    await loadCurrentChapterContent()
   } finally {
     loading.value = false
   }
+  await restoreScrollPosition(store.scrollPosition)
 })
 
 // ── Chapter nav ──
 async function navigateChapter(index) {
   if (index < 0 || index >= store.totalChapters) return
+  flushReadingPosition()
   store.goToChapter(index)
-  const ch = store.currentChapter
-  if (ch?.url && !ch.content && (store.currentBook?.format === 'online' || store.currentBook?.sourceId === 'universal')) {
-    loading.value = true
-    try {
-      const res = store.currentBook.sourceId === 'universal'
-        ? await window.electronAPI?.fetchContent(ch.url)
-        : await window.electronAPI?.fetchSourceChapter(store.currentBook.sourceId, ch.url)
-      if (res?.success) ch.content = res.data
-    } catch {}
-    loading.value = false
-  }
+  loading.value = true
+  await loadCurrentChapterContent()
+  loading.value = false
   await nextTick()
   currentPage.value = 0
   slideOffset.value = 0
@@ -349,6 +350,54 @@ async function navigateChapter(index) {
 function prevChapter() { navigateChapter(store.currentChapterIndex - 1) }
 function nextChapter() { navigateChapter(store.currentChapterIndex + 1) }
 function jumpToChapter(index) { navigateChapter(index) }
+async function jumpToBookmark(bookmark) {
+  await navigateChapter(bookmark.chapterIndex)
+  await nextTick()
+  const maxScroll = bodyRef.value ? bodyRef.value.scrollHeight - bodyRef.value.clientHeight : 0
+  if (bodyRef.value && maxScroll > 0) {
+    bodyRef.value.scrollTop = (bookmark.scrollPct / 100) * maxScroll
+    store.updateProgress(bookmark.scrollPct)
+  }
+}
+
+async function loadCurrentChapterContent() {
+  const ch = store.currentChapter
+  const book = store.currentBook
+  if (!ch || !book) return
+  cacheState.value = ch.content ? 'idle' : 'loading'
+  if (ch.content) return
+  if (!(book.format === 'online' || book.sourceId === 'universal')) return
+
+  try {
+    const cached = await window.electronAPI?.getChapterCache(book.id, ch.index ?? store.currentChapterIndex)
+    if (cached?.success && cached.data?.content) {
+      ch.content = cached.data.content
+      cacheState.value = 'cached'
+      return
+    }
+  } catch {}
+
+  try {
+    const res = book.sourceId === 'universal'
+      ? await window.electronAPI?.fetchContent(ch.url)
+      : await window.electronAPI?.fetchSourceChapter(book.sourceId, ch.url)
+    if (res?.success && res.data) {
+      ch.content = res.data
+      cacheState.value = 'network'
+      await window.electronAPI?.saveChapterCache({
+        bookId: book.id,
+        chapterIndex: ch.index ?? store.currentChapterIndex,
+        chapterTitle: ch.title,
+        content: res.data,
+        sourceId: book.sourceId,
+        chapterUrl: ch.url
+      })
+      await store.loadCacheStats()
+    }
+  } catch {
+    cacheState.value = 'idle'
+  }
+}
 
 // ── Preload ──
 async function preloadNext() {
@@ -358,7 +407,18 @@ async function preloadNext() {
       const res = store.currentBook.sourceId === 'universal'
         ? await window.electronAPI?.fetchContent(next.url)
         : await window.electronAPI?.fetchSourceChapter(store.currentBook.sourceId, next.url)
-      if (res?.success) next.content = res.data
+      if (res?.success) {
+        next.content = res.data
+        await window.electronAPI?.saveChapterCache({
+          bookId: store.currentBook.id,
+          chapterIndex: next.index ?? store.currentChapterIndex + 1,
+          chapterTitle: next.title,
+          content: res.data,
+          sourceId: store.currentBook.sourceId,
+          chapterUrl: next.url
+        })
+        await store.loadCacheStats()
+      }
     } catch {}
   }
 }
@@ -389,10 +449,10 @@ function onKeydown(e) {
   if (e.key === 'PageDown') { e.preventDefault(); nextChapter(); return }
 
   // Shortcuts
-  if (e.key === 'Escape') { router.push('/'); return }
+  if (e.key === 'Escape') { backToLibrary(); return }
   if (e.key === 't' || e.key === 'T') { showToc.value = !showToc.value; return }
   if (e.key === 's' || e.key === 'S') { showSettings.value = !showSettings.value; return }
-  if (e.key === 'b' || e.key === 'B') { /* bookmark */ return }
+  if (e.key === 'b' || e.key === 'B') { toggleBookmark(); return }
 }
 onMounted(() => window.addEventListener('keydown', onKeydown))
 onUnmounted(() => window.removeEventListener('keydown', onKeydown))
@@ -419,6 +479,16 @@ function seekProgress(e) {
   bodyRef.value.scrollTop = ratio * (bodyRef.value.scrollHeight - bodyRef.value.clientHeight)
 }
 
+function toggleBookmark() {
+  if (bodyRef.value && store.settings.readingMode === 'scroll') {
+    const { scrollTop, scrollHeight, clientHeight } = bodyRef.value
+    const pct = Math.round((scrollTop / (scrollHeight - clientHeight)) * 100) || 0
+    scrollPercent.value = pct
+  }
+  store.updateProgress(scrollPercent.value)
+  store.toggleBookmark()
+}
+
 // ── Auto scroll ──
 let autoScrollTimer = null
 function toggleAutoScroll() {
@@ -441,10 +511,47 @@ function onMouseMove() {
 }
 
 onUnmounted(() => {
+  flushReadingPosition()
   clearInterval(autoScrollTimer)
   clearTimeout(hideTimer)
   clearTimeout(scrollTimer)
 })
+
+function currentScrollPct() {
+  if (store.settings.readingMode === 'scroll' && bodyRef.value) {
+    const { scrollTop, scrollHeight, clientHeight } = bodyRef.value
+    return Math.round((scrollTop / (scrollHeight - clientHeight)) * 100) || 0
+  }
+  if ((store.settings.readingMode === 'paged' || store.settings.readingMode === 'slide') && totalPages.value > 1) {
+    return Math.round((currentPage.value / Math.max(1, totalPages.value - 1)) * 100)
+  }
+  return scrollPercent.value
+}
+
+function flushReadingPosition() {
+  clearTimeout(scrollTimer)
+  scrollPercent.value = currentScrollPct()
+  store.syncCurrentBookProgress(scrollPercent.value)
+}
+
+async function restoreScrollPosition(scrollPct) {
+  if (!bodyRef.value || !scrollPct || store.settings.readingMode !== 'scroll') return
+  await nextTick()
+  await nextTick()
+  let maxScroll = bodyRef.value.scrollHeight - bodyRef.value.clientHeight
+  if (maxScroll <= 0) {
+    await new Promise(resolve => setTimeout(resolve, 50))
+    maxScroll = bodyRef.value.scrollHeight - bodyRef.value.clientHeight
+  }
+  if (maxScroll <= 0) return
+  bodyRef.value.scrollTop = (scrollPct / 100) * maxScroll
+  scrollPercent.value = scrollPct
+}
+
+function backToLibrary() {
+  flushReadingPosition()
+  router.push('/')
+}
 </script>
 
 <style scoped>
@@ -486,6 +593,11 @@ onUnmounted(() => {
   -webkit-app-region: no-drag; flex-shrink: 0;
 }
 .r-hdr-btn:hover { opacity: 1; background: rgba(128,128,128,0.08); }
+.r-hdr-btn.active {
+  opacity: 1;
+  color: var(--color-primary);
+  background: rgba(201,107,44,0.1);
+}
 .chapter-label {
   font-size: 13px; opacity: 0.6;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -569,6 +681,16 @@ onUnmounted(() => {
 .chap-indicator { opacity: 0.45; white-space: nowrap; min-width: 40px; }
 .progress-pct { opacity: 0.4; min-width: 30px; text-align: right; font-variant-numeric: tabular-nums; }
 .time-est { opacity: 0.35; font-size: 11px; white-space: nowrap; }
+.cache-state {
+  min-width: 52px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+.cache-state.cached { color: #2ea043; }
+.cache-state.network { color: var(--color-primary); }
+.cache-state.loading { opacity: 0.5; }
 .progress-track {
   flex: 1; height: 3px;
   background: rgba(128,128,128,0.15); border-radius: 2px;

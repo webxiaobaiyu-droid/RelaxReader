@@ -5,6 +5,7 @@ export const useReaderStore = defineStore('reader', () => {
   // ── Library ──
   const books = ref([])
   const loaded = ref(false)
+  const cacheStats = ref({ chapters: 0, size: 0, byBook: {} })
 
   // ── Current reading ──
   const currentBook = ref(null)
@@ -67,6 +68,10 @@ export const useReaderStore = defineStore('reader', () => {
         lastReadAt: b.lastReadAt,
         lastChapter: b.lastChapter ?? 0,
         progress: b.progress ?? 0,
+        lastScrollPos: b.lastScrollPos ?? 0,
+        bookmarks: Array.isArray(b.bookmarks) ? b.bookmarks : [],
+        cachedChapters: b.cachedChapters ?? 0,
+        cacheSize: b.cacheSize ?? 0,
         fileSize: b.fileSize,
         // Online book fields — needed to re-fetch chapters
         sourceId: b.sourceId ?? null,
@@ -87,6 +92,41 @@ export const useReaderStore = defineStore('reader', () => {
       }
     } catch (e) {
       console.error('Failed to load settings:', e)
+    }
+  }
+
+  /** Load chapter cache stats for library badges and settings surfaces */
+  async function loadCacheStats() {
+    try {
+      const result = await window.electronAPI?.getChapterCacheStats()
+      if (result?.success && result.data) {
+        cacheStats.value = result.data
+        for (const book of books.value) {
+          const stats = result.data.byBook?.[book.id]
+          book.cachedChapters = stats?.chapters ?? 0
+          book.cacheSize = stats?.size ?? 0
+        }
+      }
+    } catch (e) {
+      console.error('Failed to load cache stats:', e)
+    }
+  }
+
+  async function clearBookCache(bookId) {
+    try {
+      const result = await window.electronAPI?.clearChapterCache(bookId)
+      if (result?.success) {
+        await loadCacheStats()
+        const book = books.value.find(b => b.id === bookId)
+        if (book) {
+          book.cachedChapters = 0
+          book.cacheSize = 0
+        }
+      }
+      return result
+    } catch (e) {
+      console.error('Failed to clear cache:', e)
+      return { success: false, error: e.message }
     }
   }
 
@@ -119,6 +159,8 @@ export const useReaderStore = defineStore('reader', () => {
         lastChapter: book.lastChapter ?? exists.lastChapter ?? 0,
         progress: book.progress ?? exists.progress ?? 0
       })
+      exists.bookmarks = Array.isArray(book.bookmarks) ? book.bookmarks : (exists.bookmarks ?? [])
+      exists.lastScrollPos = book.lastScrollPos ?? exists.lastScrollPos ?? 0
       if (book.chapters && !exists.chapters) {
         exists.chapters = book.chapters
       }
@@ -143,8 +185,23 @@ export const useReaderStore = defineStore('reader', () => {
     if (existing?.chapters?.length) {
       // Already have chapters loaded
       currentBook.value = existing
+    } else if (existing?.sourceId === 'universal' && existing?.bookUrl) {
+      // Universal URL book — re-parse the page (must come BEFORE the generic
+      // 'online' branch since universal books also have format='online')
+      try {
+        const res = await window.electronAPI?.parseUrl(existing.bookUrl)
+        if (res?.success && res.data?.chapters?.length) {
+          existing.chapters = res.data.chapters.map((ch, i) => ({
+            index: i, title: ch.title, url: ch.url, content: ''
+          }))
+          existing.totalChapters = existing.chapters.length
+        }
+      } catch (e) {
+        console.error('Failed to re-parse book page:', e)
+      }
+      currentBook.value = existing
     } else if (existing?.format === 'online' && existing?.bookUrl) {
-      // Online book without chapters — re-fetch from source
+      // Online book without chapters — re-fetch from registered source
       try {
         const res = await window.electronAPI?.fetchSourceBook(existing.sourceId, existing.bookUrl)
         if (res?.success && res.data?.chapters?.length) {
@@ -160,26 +217,22 @@ export const useReaderStore = defineStore('reader', () => {
         console.error('Failed to re-fetch chapters:', e)
       }
       currentBook.value = existing
-    } else if (existing?.sourceId === 'universal' && existing?.bookUrl) {
-      // Universal URL book — re-parse the page
-      try {
-        const res = await window.electronAPI?.parseUrl(existing.bookUrl)
-        if (res?.success && res.data?.chapters?.length) {
-          existing.chapters = res.data.chapters.map((ch, i) => ({
-            index: i, title: ch.title, url: ch.url, content: ''
-          }))
-          existing.totalChapters = existing.chapters.length
-        }
-      } catch (e) {
-        console.error('Failed to re-parse book page:', e)
-      }
-      currentBook.value = existing
     } else if (existing?.filePath) {
       // Local file — re-parse
       const result = await window.electronAPI?.parseBook(existing.filePath)
       if (result?.success && result.data) {
-        currentBook.value = result.data
-        addBook(result.data)
+        const parsed = {
+          ...result.data,
+          lastReadAt: existing.lastReadAt,
+          lastChapter: existing.lastChapter ?? 0,
+          lastScrollPos: existing.lastScrollPos ?? 0,
+          progress: existing.progress ?? 0,
+          bookmarks: existing.bookmarks ?? [],
+          cachedChapters: existing.cachedChapters ?? 0,
+          cacheSize: existing.cacheSize ?? 0
+        }
+        addBook(parsed)
+        currentBook.value = books.value.find(b => b.id === parsed.id) ?? parsed
       }
     } else {
       currentBook.value = existing ?? null
@@ -210,6 +263,7 @@ export const useReaderStore = defineStore('reader', () => {
     scrollPosition.value = scrollPct
     if (currentBook.value) {
       currentBook.value.lastScrollPos = scrollPct
+      currentBook.value.lastChapter = currentChapterIndex.value
       // Overall progress: chapter-level + intra-chapter contribution
       const chapterProgress = totalChapters.value > 0
         ? currentChapterIndex.value / totalChapters.value
@@ -221,10 +275,65 @@ export const useReaderStore = defineStore('reader', () => {
     }
   }
 
+  function syncCurrentBookProgress(scrollPct = scrollPosition.value) {
+    if (!currentBook.value) return
+    updateProgress(scrollPct)
+    currentBook.value.lastReadAt = Date.now()
+
+    const libraryBook = books.value.find(b => b.id === currentBook.value.id)
+    if (libraryBook && libraryBook !== currentBook.value) {
+      libraryBook.lastReadAt = currentBook.value.lastReadAt
+      libraryBook.lastChapter = currentBook.value.lastChapter ?? currentChapterIndex.value
+      libraryBook.lastScrollPos = currentBook.value.lastScrollPos ?? scrollPct
+      libraryBook.progress = currentBook.value.progress ?? 0
+      libraryBook.bookmarks = currentBook.value.bookmarks ?? libraryBook.bookmarks ?? []
+    }
+  }
+
+  function bookmarkKey(bookId, chapterIndex, scrollPct) {
+    return `${bookId}-${chapterIndex}-${Math.round(scrollPct)}`
+  }
+
+  function isCurrentBookmarked() {
+    if (!currentBook.value) return false
+    const pct = Math.round(scrollPosition.value)
+    return (currentBook.value.bookmarks ?? []).some(b =>
+      b.chapterIndex === currentChapterIndex.value && Math.abs((b.scrollPct ?? 0) - pct) <= 2
+    )
+  }
+
+  function toggleBookmark(note = '') {
+    if (!currentBook.value || !currentChapter.value) return false
+    const pct = Math.round(scrollPosition.value)
+    const bookmarks = currentBook.value.bookmarks ?? []
+    const existingIndex = bookmarks.findIndex(b =>
+      b.chapterIndex === currentChapterIndex.value && Math.abs((b.scrollPct ?? 0) - pct) <= 2
+    )
+
+    if (existingIndex >= 0) {
+      bookmarks.splice(existingIndex, 1)
+      currentBook.value.bookmarks = bookmarks
+      return false
+    }
+
+    bookmarks.push({
+      id: bookmarkKey(currentBook.value.id, currentChapterIndex.value, pct),
+      chapterIndex: currentChapterIndex.value,
+      chapterTitle: currentChapter.value.title,
+      scrollPct: pct,
+      note,
+      createdAt: Date.now()
+    })
+    bookmarks.sort((a, b) => a.chapterIndex - b.chapterIndex || a.scrollPct - b.scrollPct)
+    currentBook.value.bookmarks = bookmarks
+    return true
+  }
+
   return {
-    books, loaded, currentBook, currentChapterIndex, currentChapter,
+    books, loaded, cacheStats, currentBook, currentChapterIndex, currentChapter,
     scrollPosition, settings, totalChapters, progressPercent,
-    loadBooks, loadSettings,
-    addBook, removeBook, openBook, goToChapter, updateProgress
+    loadBooks, loadSettings, loadCacheStats, clearBookCache,
+    addBook, removeBook, openBook, goToChapter, updateProgress,
+    syncCurrentBookProgress, isCurrentBookmarked, toggleBookmark
   }
 })

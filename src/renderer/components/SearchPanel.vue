@@ -1,22 +1,19 @@
 <template>
   <div class="sp-wrap">
-    <!-- Search/URL bar -->
+    <!-- Search bar -->
     <div class="sp-bar">
       <svg class="sp-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
       <input
         ref="inputRef"
         v-model="query"
         class="sp-input"
-        :placeholder="searchMode ? '搜索小说名...' : '粘贴小说网址...'"
+        placeholder="搜索在线书源..."
         @keydown.escape="close"
-        @keydown.enter="doAction"
+        @keydown.enter="doSearch"
       />
       <button v-if="query" class="sp-clear" @click="query = ''; error = ''">✕</button>
-      <button class="sp-mode-btn" @click="searchMode = !searchMode" :title="searchMode ? '切换到网址导入' : '切换到搜索'">
-        {{ searchMode ? '🔗' : '🔍' }}
-      </button>
-      <button class="sp-go" @click="doAction" :disabled="!query || loading">
-        {{ searchMode ? '搜索' : '导入' }}
+      <button class="sp-go" @click="doSearch" :disabled="!query || loading">
+        搜索
       </button>
     </div>
 
@@ -38,6 +35,20 @@
       <div class="sp-results-header">
         <span>找到 {{ searchResults.length }} 本书</span>
         <button class="sp-close-btn" @click="searchResults = []">✕</button>
+      </div>
+      <!-- Per-source status strip -->
+      <div v-if="sourceMeta.length > 1" class="sp-source-strip">
+        <span
+          v-for="m in sourceMeta"
+          :key="m.id"
+          class="sp-src-chip"
+          :class="{ fail: m.error }"
+          :title="m.error || `${m.count} 条 · ${m.latencyMs}ms`"
+        >
+          {{ m.name }}
+          <em v-if="!m.error">{{ m.count }}</em>
+          <em v-else>×</em>
+        </span>
       </div>
       <div
         v-for="(book, i) in searchResults"
@@ -68,8 +79,8 @@ const loading = ref(false)
 const loadingMsg = ref('')
 const error = ref('')
 const inputRef = ref(null)
-const searchMode = ref(true)  // true = search, false = URL import
 const searchResults = ref([])
+const sourceMeta = ref([])    // [{ id, name, count, latencyMs, error }]
 
 const palettes = [
   ['#8b5a2b','#c97a3e'],['#3f4b8c','#6b7fd4'],['#7d3c00','#c45a1a'],
@@ -81,14 +92,6 @@ function coverStyle(book) {
   return { background: `linear-gradient(135deg, ${a}, ${b})` }
 }
 
-async function doAction() {
-  if (searchMode.value) {
-    await doSearch()
-  } else {
-    await doImport()
-  }
-}
-
 async function doSearch() {
   const val = query.value.trim()
   if (!val) return
@@ -96,47 +99,28 @@ async function doSearch() {
   loading.value = true
   error.value = ''
   searchResults.value = []
-  loadingMsg.value = '正在搜索笔趣阁...'
+  sourceMeta.value = []
+  loadingMsg.value = '正在并发搜索全部启用书源...'
 
   try {
     const res = await window.electronAPI?.searchSource(val)
-    if (res?.success && Array.isArray(res.data) && res.data.length > 0) {
-      searchResults.value = res.data
-    } else if (res?.success && res.data?.length === 0) {
-      error.value = '未找到相关小说'
+    if (res?.success) {
+      sourceMeta.value = res.meta?.sources || []
+      if (Array.isArray(res.data) && res.data.length > 0) {
+        searchResults.value = res.data
+      } else {
+        const failed = sourceMeta.value.filter(m => m.error)
+        if (failed.length && failed.length === sourceMeta.value.length) {
+          error.value = `所有书源都失败了：${failed[0].error}`
+        } else {
+          error.value = '未找到相关小说'
+        }
+      }
     } else {
       error.value = res?.error || '搜索失败，请稍后重试'
     }
   } catch (e) {
     error.value = '网络错误，请检查网络连接'
-  } finally {
-    loading.value = false
-  }
-}
-
-async function doImport() {
-  const val = query.value.trim()
-  if (!val) return
-
-  if (!/^https?:\/\//.test(val)) {
-    error.value = '请输入完整的网址（以 http:// 或 https:// 开头）'
-    return
-  }
-
-  loading.value = true
-  error.value = ''
-  loadingMsg.value = '正在解析页面...'
-
-  try {
-    const res = await window.electronAPI?.parseUrl(val)
-    if (res?.success && res.data) {
-      emit('select', { ...res.data, sourceId: 'universal' })
-      query.value = ''
-    } else {
-      error.value = res?.error || '无法解析该页面，请确认是小说目录页'
-    }
-  } catch (e) {
-    error.value = '网络错误，请检查网址是否正确'
   } finally {
     loading.value = false
   }
@@ -163,12 +147,13 @@ defineExpose({ close })
   display: flex; align-items: center;
   background: var(--surface-card);
   border: 1px solid var(--border-light);
-  border-radius: 10px;
-  padding: 0 8px;
-  height: 38px; gap: 6px;
-  transition: border-color 0.2s, box-shadow 0.2s;
+  border-radius: 11px;
+  padding: 0 10px;
+  height: 42px; gap: 8px;
+  transition: border-color 0.18s, box-shadow 0.18s, background 0.18s;
   overflow: hidden;
 }
+.sp-bar:hover { border-color: var(--text-tertiary); }
 .sp-bar:focus-within {
   border-color: var(--color-primary);
   box-shadow: 0 0 0 3px rgba(201,107,44,0.1);
@@ -177,11 +162,11 @@ defineExpose({ close })
 .sp-input {
   flex: 1; min-width: 0; border: none; outline: none;
   background: transparent;
-  font-size: 13px; color: var(--text-primary);
+  font-size: 13.5px; color: var(--text-primary);
   font-family: inherit;
   overflow: hidden; text-overflow: ellipsis;
 }
-.sp-input::placeholder { color: var(--text-tertiary); font-size: 12px; }
+.sp-input::placeholder { color: var(--text-tertiary); font-size: 13px; }
 .sp-clear {
   width: 18px; height: 18px; border-radius: 50%;
   border: none; background: var(--border-light);
@@ -189,19 +174,14 @@ defineExpose({ close })
   display: flex; align-items: center; justify-content: center;
   color: var(--text-secondary); flex-shrink: 0;
 }
-.sp-mode-btn {
-  width: 24px; height: 24px; border: none; background: transparent;
-  cursor: pointer; font-size: 14px; flex-shrink: 0;
-  border-radius: 4px; transition: background 0.15s;
-}
-.sp-mode-btn:hover { background: var(--surface-overlay); }
 .sp-go {
-  padding: 4px 14px; border-radius: 7px;
+  padding: 6px 16px; border-radius: 8px;
   border: none; background: var(--color-primary); color: #fff;
-  font-size: 12px; font-weight: 600; cursor: pointer;
-  flex-shrink: 0; transition: opacity 0.15s;
+  font-size: 12.5px; font-weight: 600; cursor: pointer;
+  flex-shrink: 0; transition: background 0.15s, opacity 0.15s;
   white-space: nowrap;
 }
+.sp-go:hover:not(:disabled) { background: var(--color-primary-dark); }
 .sp-go:disabled { opacity: 0.4; cursor: default; }
 
 /* Dropdown */
@@ -244,6 +224,24 @@ defineExpose({ close })
   display: flex; align-items: center; justify-content: center;
 }
 .sp-close-btn:hover { background: var(--surface-overlay); }
+
+.sp-source-strip {
+  display: flex; gap: 6px; flex-wrap: wrap;
+  padding: 8px 14px; border-bottom: 1px solid var(--border-light);
+  background: var(--surface-overlay);
+}
+.sp-src-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 7px; border-radius: 10px;
+  font-size: 10.5px; color: var(--text-secondary);
+  background: var(--surface-card); border: 1px solid var(--border-light);
+}
+.sp-src-chip em {
+  font-style: normal; font-weight: 700;
+  color: var(--color-primary);
+}
+.sp-src-chip.fail { color: #cf222e; border-color: rgba(207,34,46,0.3); }
+.sp-src-chip.fail em { color: #cf222e; }
 
 .sp-result-item {
   display: flex; gap: 12px; padding: 10px 14px;
